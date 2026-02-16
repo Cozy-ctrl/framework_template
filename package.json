@@ -1,0 +1,11 @@
+{
+  "name": "framework-template-sprite-runner",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "sprite:run": "node scripts/run_in_sprite.mjs"
+  },
+  "dependencies": {
+    "@fly/sprites": "latest"
+  }
+}

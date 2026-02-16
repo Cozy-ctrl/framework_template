@@ -1,0 +1,5 @@
+pydantic-ai>=1.16
+python-dotenv>=1.0.1
+pydantic>=2.10
+requests>=2.32.0
+streamlit>=1.40.0
