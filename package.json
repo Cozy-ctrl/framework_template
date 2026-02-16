@@ -6,6 +6,7 @@
     "sprite:run": "node scripts/run_in_sprite.mjs"
   },
   "dependencies": {
-    "@fly/sprites": "latest"
+    "@fly/sprites": "latest",
+    "ws": "^8.18.0"
   }
 }

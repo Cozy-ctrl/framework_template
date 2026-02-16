@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from typing import Callable
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -31,6 +32,34 @@ def _story_tts_transcript(*, headline: str, story: str) -> str:
     return f"{headline}. {story.strip()}"
 
 
+def _save_env_var(*, dotenv_path: Path, key: str, value: str) -> None:
+    escaped_value = value.replace("\\", "\\\\").replace('"', '\\"')
+    new_line = f'{key}="{escaped_value}"\n'
+
+    if not dotenv_path.exists():
+        dotenv_path.write_text(new_line, encoding="utf-8")
+        return
+
+    lines = dotenv_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    updated_lines: list[str] = []
+    found = False
+
+    for line in lines:
+        if line.startswith(f"{key}="):
+            if not found:
+                updated_lines.append(new_line)
+                found = True
+            continue
+        updated_lines.append(line)
+
+    if not found:
+        if updated_lines and not updated_lines[-1].endswith("\n"):
+            updated_lines[-1] = f"{updated_lines[-1]}\n"
+        updated_lines.append(new_line)
+
+    dotenv_path.write_text("".join(updated_lines), encoding="utf-8")
+
+
 def _run_in_sprite(
     *,
     topic: str,
@@ -41,9 +70,11 @@ def _run_in_sprite(
     cartesia_api_key: str,
     synthesize_audio: bool,
     sprites_token: str,
+    sprite_name: str,
     sprite_git_repo: str,
     sprite_git_ref: str,
     keep_sprite: bool,
+    log_callback: Callable[[str], None] | None = None,
 ) -> tuple[StoryPlan, WrittenStories, str, str, str]:
     project_root = Path(__file__).resolve().parents[1]
     cmd = [
@@ -57,6 +88,8 @@ def _run_in_sprite(
         provider_name,
         "--output-dir",
         output_dir,
+        "--sprite-name",
+        sprite_name,
         "--git-repo",
         sprite_git_repo,
     ]
@@ -76,27 +109,39 @@ def _run_in_sprite(
     if synthesize_audio and cartesia_api_key:
         env["CARTESIA_API_KEY"] = cartesia_api_key
 
-    result = subprocess.run(
+    process = subprocess.Popen(
         cmd,
         cwd=project_root,
         env=env,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
-        check=False,
+        bufsize=1,
     )
 
-    if result.returncode != 0:
-        stderr_tail = "\n".join(result.stderr.splitlines()[-20:])
+    marker_line = ""
+    stderr_tail_lines: list[str] = []
+
+    if process.stdout is not None:
+        for raw_line in process.stdout:
+            line = raw_line.rstrip("\n")
+            if line.startswith(RESULT_MARKER):
+                marker_line = line
+                continue
+            if log_callback is not None and line:
+                log_callback(line)
+            stderr_tail_lines.append(line)
+            if len(stderr_tail_lines) > 50:
+                stderr_tail_lines.pop(0)
+
+    return_code = process.wait()
+
+    if return_code != 0:
+        stderr_tail = "\n".join(stderr_tail_lines[-20:])
         raise RuntimeError(
             "Sprite run failed. Ensure Node dependencies are installed with `npm install` and check token/repo settings.\n"
             f"{stderr_tail}"
         )
-
-    marker_line = ""
-    for line in result.stdout.splitlines():
-        if line.startswith(RESULT_MARKER):
-            marker_line = line
-            break
 
     if not marker_line:
         raise RuntimeError("Sprite run completed but no structured result was returned.")
@@ -143,6 +188,11 @@ def main() -> None:
             value=os.getenv("SPRITES_TOKEN", os.getenv("SPRITE_TOKEN", "")),
             type="password",
         )
+        sprite_name_input = st.text_input(
+            "Sprite Name",
+            value=os.getenv("SPRITE_NAME", "template-agent-main"),
+            help="Use a stable name to reuse one Sprite instance across runs.",
+        )
         sprite_git_repo = st.text_input(
             "Sprite Git Repo URL",
             value=os.getenv("SPRITE_GIT_REPO", ""),
@@ -153,7 +203,7 @@ def main() -> None:
             value=os.getenv("SPRITE_GIT_REF", ""),
             help="Branch, tag, or commit. Defaults to repository default branch.",
         )
-        keep_sprite = st.checkbox("Keep sprite after run", value=False)
+        keep_sprite = st.checkbox("Keep sprite after run", value=True)
 
     topic = st.text_input("Topic", value="")
     run = st.button(f"Generate {STORY_COUNT} stories", type="primary")
@@ -192,6 +242,20 @@ def main() -> None:
         st.warning("Provide a Git repo URL for Sprite mode.")
         return
 
+    if run_in_sprite and not sprite_name_input.strip():
+        st.warning("Provide a Sprite name for Sprite mode.")
+        return
+
+    if run_in_sprite:
+        sprite_name_value = sprite_name_input.strip()
+        project_root = Path(__file__).resolve().parents[1]
+        try:
+            _save_env_var(dotenv_path=project_root / ".env", key="SPRITE_NAME", value=sprite_name_value)
+            os.environ["SPRITE_NAME"] = sprite_name_value
+        except OSError as error:
+            st.warning(f"Could not save SPRITE_NAME to .env: {error}")
+            return
+
     total_steps = 1 if run_in_sprite else (4 if synthesize_audio else 3)
     progress_bar = st.progress(0)
     status_line = st.empty()
@@ -202,13 +266,22 @@ def main() -> None:
 
     audio_by_story_index: dict[int, bytes] = {}
     combined_audio: bytes | None = None
-    sprite_name = ""
+    sprite_result_name = ""
     audio_bunny_url = ""
 
     with st.status("Running workflow...", expanded=True):
         if run_in_sprite:
             _set_step(1, "Running agent inside Fly Sprite")
-            plan, written, run_dir_text, sprite_name, audio_bunny_url = _run_in_sprite(
+            sprite_log_lines: list[str] = []
+            sprite_logs = st.empty()
+
+            def _on_sprite_log(line: str) -> None:
+                sprite_log_lines.append(line)
+                if len(sprite_log_lines) > 200:
+                    sprite_log_lines.pop(0)
+                sprite_logs.code("\n".join(sprite_log_lines), language="bash")
+
+            plan, written, run_dir_text, sprite_result_name, audio_bunny_url = _run_in_sprite(
                 topic=topic.strip(),
                 model_name=model_name,
                 provider_name=provider_name,
@@ -217,9 +290,11 @@ def main() -> None:
                 cartesia_api_key=cartesia_key,
                 synthesize_audio=synthesize_audio,
                 sprites_token=sprites_token,
+                sprite_name=sprite_name_input.strip(),
                 sprite_git_repo=sprite_git_repo.strip(),
                 sprite_git_ref=sprite_git_ref,
                 keep_sprite=keep_sprite,
+                log_callback=_on_sprite_log,
             )
             run_dir = Path(run_dir_text)
         else:
@@ -281,7 +356,7 @@ def main() -> None:
     c3.metric("Audio clips", len(audio_by_story_index))
 
     if run_in_sprite:
-        sprite_text = f" (sprite: {sprite_name})" if sprite_name else ""
+        sprite_text = f" (sprite: {sprite_result_name})" if sprite_result_name else ""
         st.success(f"Sprite run complete{sprite_text}. Output folder in sprite: {run_dir}")
     else:
         st.success(f"Output folder: {run_dir}")

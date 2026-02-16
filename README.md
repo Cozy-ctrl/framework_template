@@ -59,11 +59,17 @@ python3 -m streamlit run template_agent/app.py
 2. Enable **Run workflow inside Fly Sprite**.
 3. Provide:
    - `Sprites Token`
+   - `Sprite Name` (use a stable name like `template-agent-main`)
    - `Sprite Git Repo URL` (a repo the sprite can `git clone`)
    - Optional `Sprite Git Ref` (branch/tag/commit)
 4. Click **Generate 3 stories**.
 
 When enabled, clicking Start runs `template_agent.cli` inside a new Sprite, then returns generated story JSON to the UI.
+
+With **Keep sprite after run** enabled (default), the same sprite is reused across runs:
+
+- First run does clone + venv + pip install.
+- Later runs reuse the existing filesystem and only run `pip install` again if `requirements.txt` changed.
 
 ## Environment variables
 
@@ -76,6 +82,7 @@ When enabled, clicking Start runs `template_agent.cli` inside a new Sprite, then
 - `BUNNY_STORAGE_ACCESS_KEY` (required for audio synthesis; Bunny storage access key)
 - `BUNNY_STORAGE_PREFIX` (optional; default `audio`)
 - `SPRITES_TOKEN` or `SPRITE_TOKEN` (required for Sprite mode)
+- `SPRITE_NAME` (optional default for Sprite Name in UI)
 - `SPRITE_GIT_REPO` (optional default for Sprite Git Repo URL in UI)
 - `SPRITE_GIT_REF` (optional default branch/tag/commit for Sprite mode)
 

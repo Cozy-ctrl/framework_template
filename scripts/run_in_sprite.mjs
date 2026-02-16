@@ -1,6 +1,39 @@
+import { WebSocket } from 'ws';
+Object.defineProperty(globalThis, 'WebSocket', {
+  value: WebSocket,
+  writable: true,
+  configurable: true,
+});
+
 import { ExecError, SpritesClient } from '@fly/sprites';
 
 const RESULT_MARKER = '__SPRITE_RESULT__';
+
+function appendChunk(target, chunk) {
+  if (Buffer.isBuffer(chunk)) {
+    return target + chunk.toString('utf8');
+  }
+  return target + String(chunk);
+}
+
+async function runStreamingCommand(sprite, command, args = [], options = {}) {
+  const cmd = sprite.spawn(command, args, options);
+  let stdout = '';
+  let stderr = '';
+
+  cmd.stdout.on('data', (chunk) => {
+    stdout = appendChunk(stdout, chunk);
+    process.stdout.write(chunk);
+  });
+
+  cmd.stderr.on('data', (chunk) => {
+    stderr = appendChunk(stderr, chunk);
+    process.stderr.write(chunk);
+  });
+
+  const exitCode = await cmd.wait();
+  return { exitCode, stdout, stderr };
+}
 
 function parseArgs(argv) {
   const args = {};
@@ -63,30 +96,60 @@ async function run() {
   }
 
   const client = new SpritesClient(spritesToken);
-  const spriteName = args['sprite-name'] || `template-agent-${Date.now()}`;
-  const sprite = await client.createSprite(spriteName);
+  const spriteName = args['sprite-name'] || 'template-agent-main';
+
+  let sprite;
+  try {
+    await client.getSprite(spriteName);
+    sprite = client.sprite(spriteName);
+    console.log(`[sprite] Reusing existing sprite ${spriteName}`);
+  } catch {
+    sprite = await client.createSprite(spriteName);
+    console.log(`[sprite] Created new sprite ${spriteName}`);
+  }
 
   try {
-    console.log(`[sprite] Created ${spriteName}`);
     console.log('[sprite] Bootstrapping project in sprite...');
 
-    await sprite.execFile(
+    const bootstrapResult = await runStreamingCommand(
+      sprite,
       'bash',
       [
         '-lc',
         [
           'set -euo pipefail',
           'mkdir -p /workspace',
-          'rm -rf /workspace/framework_template',
-          'git clone --depth 1 "$GIT_REPO" /workspace/framework_template',
-          'if [ -n "$GIT_REF" ]; then',
-          '  cd /workspace/framework_template',
-          '  git fetch --depth 1 origin "$GIT_REF"',
-          '  git checkout "$GIT_REF"',
+          'if [ ! -d /workspace/framework_template/.git ]; then',
+          '  cd /workspace',
+          '  rm -rf /workspace/framework_template',
+          '  git clone --depth 1 "$GIT_REPO" /workspace/framework_template',
           'fi',
           'cd /workspace/framework_template',
-          'python3 -m venv .venv',
-          '/workspace/framework_template/.venv/bin/python3 -m pip install -r requirements.txt',
+          'git remote set-url origin "$GIT_REPO"',
+          'git fetch --prune --tags origin',
+          'if [ -n "$GIT_REF" ]; then',
+          '  git checkout "$GIT_REF"',
+          '  if git show-ref --verify --quiet "refs/remotes/origin/$GIT_REF"; then',
+          '    git reset --hard "origin/$GIT_REF"',
+          '  fi',
+          'else',
+          '  current_branch=$(git symbolic-ref --short HEAD 2>/dev/null || true)',
+          '  if [ -n "$current_branch" ] && git show-ref --verify --quiet "refs/remotes/origin/$current_branch"; then',
+          '    git checkout "$current_branch"',
+          '    git reset --hard "origin/$current_branch"',
+          '  fi',
+          'fi',
+          'if [ ! -x /workspace/framework_template/.venv/bin/python3 ]; then',
+          '  python3 -m venv .venv',
+          'fi',
+          'req_hash=$(shasum requirements.txt | awk "{print $1}")',
+          'installed_hash=$(cat .venv/.requirements_hash 2>/dev/null || true)',
+          'if [ "$req_hash" != "$installed_hash" ]; then',
+          '  /workspace/framework_template/.venv/bin/python3 -m pip install -r requirements.txt',
+          '  printf "%s" "$req_hash" > .venv/.requirements_hash',
+          'else',
+          '  echo "[sprite] requirements unchanged; skipping pip install"',
+          'fi',
         ].join('\n'),
       ],
       {
@@ -94,9 +157,12 @@ async function run() {
           GIT_REPO: gitRepo,
           GIT_REF: gitRef,
         },
-        maxBuffer: 100 * 1024 * 1024,
       }
     );
+
+    if (bootstrapResult.exitCode !== 0) {
+      throw new Error(`Sprite bootstrap failed with exit code ${bootstrapResult.exitCode}.`);
+    }
 
     console.log('[sprite] Running template_agent.cli inside sprite...');
     const cliArgs = [
@@ -115,7 +181,8 @@ async function run() {
       cliArgs.push('--with-audio');
     }
 
-    const runResult = await sprite.execFile(
+    const runResult = await runStreamingCommand(
+      sprite,
       '/workspace/framework_template/.venv/bin/python3',
       cliArgs,
       {
@@ -130,15 +197,11 @@ async function run() {
           ...(bunnyStorageAccessKey ? { BUNNY_STORAGE_ACCESS_KEY: bunnyStorageAccessKey } : {}),
           ...(bunnyStoragePrefix ? { BUNNY_STORAGE_PREFIX: bunnyStoragePrefix } : {}),
         },
-        maxBuffer: 100 * 1024 * 1024,
       }
     );
 
-    if (runResult.stdout) {
-      process.stdout.write(runResult.stdout);
-    }
-    if (runResult.stderr) {
-      process.stderr.write(runResult.stderr);
+    if (runResult.exitCode !== 0) {
+      throw new Error(`Sprite CLI run failed with exit code ${runResult.exitCode}.`);
     }
 
     const doneLine = runResult.stdout
@@ -185,7 +248,7 @@ async function run() {
     if (keepSprite) {
       console.log(`[sprite] Keeping sprite ${spriteName} (per --keep-sprite).`);
     } else {
-      await sprite.delete();
+      await client.deleteSprite(spriteName);
       console.log(`[sprite] Deleted ${spriteName}`);
     }
   }
